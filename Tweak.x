@@ -1,11 +1,13 @@
 // MomoSpoof — 设备身份重置（陌陌 / com.immomo.momo）
+// v2：全量清空 keychain（含登录态），首次启动生效一次
 // 环境：iOS 14 / arm64 / TrollStore + TrollFools 注入
 // 不依赖 CydiaSubstrate，未越狱环境可直接加载
 // 依赖：fishhook.c / fishhook.h（构建脚本自动下载）
 //
 // 目标：让服务端认为这是一台"全新的设备"
 //   1) 换 IDFV / IDFA / 机型 / 设备名
-//   2) 首次启动时让 keychain 里的旧设备 ID 读不到 → App 重新生成
+//   2) 首次启动清空 keychain 全部条目（generic + internet password）
+//      → 旧设备 ID 彻底消失，App 重新生成；代价是掉登录，重新登录即可
 //   3) 屏蔽越狱 / 巨魔常见检测点
 
 #import <Foundation/Foundation.h>
@@ -36,15 +38,15 @@ static NSString *const kFakeIDFV = @"9F3A1C2E-8B4D-4E7A-9C11-2D5E7F9A0B31";
 // IDFA
 static NSString *const kFakeIDFA = @"6C2B4D8E-1A3F-4B5C-8D7E-9F0A1B2C3D4E";
 
-// 是否重置 keychain 里的设备 ID（只在首次启动生效一次）
-// 注意：会让陌陌掉登录，需要重新登录
+// 是否在首次启动时清空整个 keychain（会掉登录，重新登录即可）
 static BOOL const kResetKeychainOnce = YES;
 
 // 是否屏蔽越狱 / 巨魔 / Cydia 相关检测
 static BOOL const kHideJailbreak = YES;
 // =========================================================
 
-static NSString *const kResetFlagKey = @"MomoSpoofDidReset_v1";
+// 清空只做一次，标记写成文件（不依赖 NSUserDefaults，启动早期更可靠）
+static NSString *const kWipeFlagName = @"momo_spoof_v2.flag";
 
 #pragma mark - ObjC 方法替换
 
@@ -170,84 +172,50 @@ static int hook_lstat(const char *path, struct stat *buf) {
     return orig_lstat(path, buf);
 }
 
-#pragma mark - 6. keychain 设备 ID 重置（只做一次）
+#pragma mark - 6. keychain 全量清空（只做一次）
 
-static NSArray<NSString *> *token_account_keys(void) {
-    static NSArray<NSString *> *keys;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        keys = @[ @"token", @"session", @"login", @"auth",
-                  @"password", @"passwd", @"credential", @"user" ];
-    });
-    return keys;
+static NSString *wipe_flag_path(void) {
+    NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                   NSUserDomainMask, YES);
+    NSString *docs = dirs.count > 0 ? dirs[0] : nil;
+    if (!docs) return nil;
+    return [docs stringByAppendingPathComponent:kWipeFlagName];
 }
 
-static BOOL has_token_keyword(CFDictionaryRef dict) {
-    if (!dict) return NO;
-    CFTypeRef acc = CFDictionaryGetValue(dict, kSecAttrAccount);
-    if (!acc || CFGetTypeID(acc) != CFStringGetTypeID()) return NO;
-    NSString *s = [(__bridge NSString *)acc lowercaseString];
-    if (!s) return NO;
-    for (NSString *k in token_account_keys()) {
-        if ([s containsString:k]) return YES;
+// 没写过标记 = 本次是第一次启动 → 清空并打标记
+static BOOL should_wipe_once(void) {
+    NSString *p = wipe_flag_path();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (p && [fm fileExistsAtPath:p]) return NO;
+    if (p) {
+        [@"1" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     }
-    return NO;
+    return YES;
 }
 
-static BOOL is_generic_password(CFDictionaryRef dict) {
-    if (!dict) return NO;
-    CFTypeRef cls = CFDictionaryGetValue(dict, kSecClass);
-    return cls && CFGetTypeID(cls) == CFStringGetTypeID()
-           && CFEqual(cls, kSecClassGenericPassword);
-}
-
-// 是否处于"本次启动要重置一次"的状态
-static BOOL reset_this_launch(void) {
-    static BOOL evaluated = NO;
-    static BOOL should = NO;
-    if (evaluated) return should;
-    evaluated = YES;
-    if (!kResetKeychainOnce) return NO;
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if (![d boolForKey:kResetFlagKey]) {
-        [d setBool:YES forKey:kResetFlagKey];
-        [d synchronize];
-        should = YES;
-        NSLog(@"[MomoSpoof] keychain reset armed for this launch");
+// 清掉本 App 可访问的全部 keychain 条目。
+// kSecAttrSynchronizableAny 让带 iCloud 同步标记的条目也一起删。
+static void wipe_keychain_all(void) {
+    NSArray *classes = @[ (__bridge id)kSecClassGenericPassword,
+                          (__bridge id)kSecClassInternetPassword ];
+    for (id cls in classes) {
+        NSDictionary *q = @{ (__bridge id)kSecClass: cls,
+                             (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny };
+        OSStatus st = SecItemDelete((__bridge CFDictionaryRef)q);
+        NSLog(@"[MomoSpoof] keychain wipe class=%@ status=%d", cls, (int)st);
     }
-    return should;
-}
-
-static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
-static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *);
-
-static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    if (reset_this_launch() && is_generic_password(query) && !has_token_keyword(query)) {
-        if (result) *result = NULL;
-        return errSecItemNotFound;
-    }
-    return orig_SecItemCopyMatching(query, result);
-}
-
-static OSStatus hook_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
-    if (reset_this_launch() && is_generic_password(attrs) && !has_token_keyword(attrs)) {
-        SecItemDelete(attrs); // 先删旧条目，避免 duplicate 导致写入失败
-    }
-    return orig_SecItemAdd(attrs, result);
 }
 
 #pragma mark - 初始化
 
 // 遍历 App 内所有已加载/后加载的二进制做符号重绑。
-// 只 rebind 主二进制会漏掉陌陌自己的 framework，keychain 就 hook 不到。
+// 只 rebind 主二进制会漏掉陌陌自己的 framework。
 static struct rebinding g_rb[] = {
-    {"sysctlbyname",        (void *)hook_sysctlbyname,        (void **)&orig_sysctlbyname},
-    {"uname",               (void *)hook_uname,               (void **)&orig_uname},
-    {"access",              (void *)hook_access,              (void **)&orig_access},
-    {"stat",                (void *)hook_stat,                (void **)&orig_stat},
-    {"lstat",               (void *)hook_lstat,               (void **)&orig_lstat},
-    {"SecItemCopyMatching", (void *)hook_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching},
-    {"SecItemAdd",          (void *)hook_SecItemAdd,          (void **)&orig_SecItemAdd},
+    {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
+    {"uname",        (void *)hook_uname,        (void **)&orig_uname},
+    {"access",       (void *)hook_access,       (void **)&orig_access},
+    {"stat",         (void *)hook_stat,         (void **)&orig_stat},
+    {"lstat",        (void *)hook_lstat,        (void **)&orig_lstat},
 };
 static const size_t g_rb_count = sizeof(g_rb) / sizeof(g_rb[0]);
 
@@ -272,6 +240,11 @@ static void on_image_added(const struct mach_header *mh, intptr_t slide) {
 
 __attribute__((constructor))
 static void momospoof_init(void) {
+    // 先清 keychain，再装 hook，确保 App 读到的第一手数据就是"空"
+    if (kResetKeychainOnce && should_wipe_once()) {
+        wipe_keychain_all();
+    }
+
     Class dev = [UIDevice class];
     replace_method(dev, @selector(identifierForVendor), (IMP)hook_idfv);
     replace_method(dev, @selector(name), (IMP)hook_device_name);
@@ -283,10 +256,12 @@ static void momospoof_init(void) {
     }
 
     Class app = [UIApplication class];
-    orig_canOpenURL = (BOOL (*)(id, SEL, NSURL *))replace_method(app, @selector(canOpenURL:), (IMP)hook_canOpenURL);
+    orig_canOpenURL = (BOOL (*)(id, SEL, NSURL *))replace_method(app,
+                                                                @selector(canOpenURL:),
+                                                                (IMP)hook_canOpenURL);
 
     // dyld 会立刻对已加载的 image 回调一次，后续加载的也会回调
     _dyld_register_func_for_add_image(on_image_added);
 
-    NSLog(@"[MomoSpoof] loaded machine=%s idfv=%@", kFakeMachine, kFakeIDFV);
+    NSLog(@"[MomoSpoof] v2 loaded machine=%s idfv=%@", kFakeMachine, kFakeIDFV);
 }
