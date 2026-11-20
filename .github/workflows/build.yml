@@ -32,7 +32,7 @@ jobs:
             -framework Security \
             -install_name @executable_path/Frameworks/MomoSpoof.dylib \
             -o MomoSpoof.dylib \
-            Tweak.x fishhook.c
+            -x objective-c Tweak.x -x c fishhook.c
           ls -lh MomoSpoof.dylib
           file MomoSpoof.dylib
 
