@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch fishhook
+        run: |
+          curl -fsSL -o fishhook.c https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c
+          curl -fsSL -o fishhook.h https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h
+
+      - name: Compile dylib
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=14.0 \
+            -isysroot "$SDK" \
+            -dynamiclib \
+            -fobjc-arc \
+            -O2 \
+            -framework UIKit \
+            -framework Foundation \
+            -framework Security \
+            -install_name @executable_path/Frameworks/MomoSpoof.dylib \
+            -o MomoSpoof.dylib \
+            Tweak.x fishhook.c
+          ls -lh MomoSpoof.dylib
+          file MomoSpoof.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MomoSpoof-dylib
+          path: MomoSpoof.dylib
